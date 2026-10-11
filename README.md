@@ -18,6 +18,10 @@ python train.py          # trains model + prints fairness audit
 streamlit run app.py     # launches the demo
 ```
 
+The demo now includes Shapley-style explanations, a local SQLite teacher roster,
+fairness gap summaries, and a large catalog of offline-first resources and
+intervention playbooks so support stays concrete — not a label.
+
 ## Data
 Uses a synthetic dataset (`data.py`) for the prototype. Can be swapped for the
 [Open University Learning Analytics Dataset (OULAD)](https://analyse.kmi.open.ac.uk/open-dataset) or real school data.
