@@ -1,61 +1,91 @@
+"""Tiny SQLite storage for LearnLift (built into Python - nothing to install).
+On Streamlit Cloud the file is temporary: it resets when the app restarts."""
+import sqlite3
+from datetime import datetime, timedelta
+ 
 import pandas as pd
-import streamlit as st
-
+ 
 from data import generate
-from model import FEATURES, train, fairness_audit, recommend, explain, reference_profile
-
-st.set_page_config(page_title="LearnLift", page_icon="🎓")
-st.title("🎓 LearnLift")
-st.caption("Identify support needs early - not label students.")
-
-
-@st.cache_resource
-def get_model():
-    df = generate()
-    model, metrics, test_df = train(df)
-    return model, metrics, test_df, reference_profile(df)
-
-
-model, metrics, test_df, ref = get_model()
-tab1, tab2 = st.tabs(["Student support", "Fairness audit"])
-
-with tab1:
-    c1, c2 = st.columns(2)
-    s = {
-        "attendance_pct": c1.slider("Attendance %", 30, 100, 70),
-        "avg_score": c1.slider("Average score", 0, 100, 45),
-        "assignment_completion": c1.slider("Assignment completion %", 0, 100, 55),
-        "study_hours_week": c2.slider("Study hours / week", 0, 25, 5),
-        "has_internet": int(c2.checkbox("Has internet at home", value=False)),
-        "has_device": int(c2.checkbox("Has a device (phone/PC)", value=True)),
-    }
-    prob = model.predict_proba(pd.DataFrame([s])[FEATURES])[0][1]
-    st.metric("Support-need score", f"{prob:.0%}")
-    st.progress(float(prob))
-
-    st.subheader("Why this score?")
-    exp = explain(model, s, ref)
-    up = exp[exp.effect >= 1]
-    down = exp[exp.effect <= -1]
-    if len(up):
-        st.write("**Raising the score:** " + ", ".join(
-            f"{r.factor} (+{r.effect:.0f} pts)" for r in up.itertuples()))
-    if len(down):
-        st.write("**Lowering the score (strengths):** " + ", ".join(
-            f"{r.factor} ({r.effect:.0f} pts)" for r in down.itertuples()))
-    if not len(up) and not len(down):
-        st.write("No single factor stands out - this student looks close to typical.")
-    chart = exp.set_index("factor").rename(columns={"effect": "Effect on score (percentage points)"})
-    st.bar_chart(chart)
-    st.caption("Compared with a typical on-track student. Positive = increases support need. "
-               "This guides support - a teacher should always review it.")
-
-    st.subheader("Recommended support")
-    for r in recommend(s):
-        st.write("✅", r)
-
-with tab2:
-    st.write(f"Model accuracy: **{metrics['accuracy']:.0%}**, recall: **{metrics['recall']:.0%}**")
-    st.write("Income, region and gender are **not** model inputs. They are only used here to check "
-             "whether the model works equally well across groups.")
-    st.dataframe(fairness_audit(test_df), width="stretch")
+from model import FEATURES, explain
+ 
+DB_PATH = "learnlift.db"
+ 
+ 
+def _conn():
+    return sqlite3.connect(DB_PATH)
+ 
+ 
+def init():
+    with _conn() as c:
+        c.execute("""CREATE TABLE IF NOT EXISTS assessments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            student_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            attendance_pct REAL, avg_score REAL, assignment_completion REAL,
+            study_hours_week REAL, has_internet INTEGER, has_device INTEGER,
+            score_pct REAL, reasons TEXT, recommendations TEXT)""")
+ 
+ 
+def save_assessment(student_id, s, score_pct, reasons, recs, created_at=None):
+    created_at = created_at or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with _conn() as c:
+        c.execute(
+            "INSERT INTO assessments (student_id, created_at, attendance_pct, avg_score, "
+            "assignment_completion, study_hours_week, has_internet, has_device, "
+            "score_pct, reasons, recommendations) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (student_id, created_at, s["attendance_pct"], s["avg_score"],
+             s["assignment_completion"], s["study_hours_week"], s["has_internet"],
+             s["has_device"], round(score_pct, 1), reasons, "; ".join(recs)))
+ 
+ 
+def latest_per_student():
+    """Most recent assessment for every student, highest support need first."""
+    q = """SELECT a.student_id, a.score_pct, a.reasons, a.recommendations, a.created_at
+           FROM assessments a
+           JOIN (SELECT student_id, MAX(id) AS mid FROM assessments GROUP BY student_id) m
+             ON a.id = m.mid
+           ORDER BY a.score_pct DESC"""
+    with _conn() as c:
+        return pd.read_sql_query(q, c)
+ 
+ 
+def history(student_id):
+    with _conn() as c:
+        return pd.read_sql_query(
+            "SELECT created_at, score_pct FROM assessments WHERE student_id=? ORDER BY id",
+            c, params=(student_id,))
+ 
+ 
+def clear_all():
+    with _conn() as c:
+        c.execute("DELETE FROM assessments")
+ 
+ 
+def reasons_text(exp):
+    top = exp[exp.effect >= 5].head(3)
+    return ", ".join(top.factor) if len(top) else "No single factor stands out"
+ 
+ 
+def seed_demo(model, ref, recommend):
+    """Add 8 demo students, plus one student whose score improves over 3 visits."""
+    def add(sid, s, days_ago=0):
+        p = model.predict_proba(pd.DataFrame([s])[FEATURES])[0][1]
+        exp = explain(model, s, ref)
+        when = (datetime.now() - timedelta(days=days_ago)).strftime("%Y-%m-%d %H:%M:%S")
+        save_assessment(sid, s, p * 100, reasons_text(exp), recommend(s), when)
+ 
+    sample = generate(200, seed=1).sample(8, random_state=3).reset_index(drop=True)
+    for i, row in sample.iterrows():
+        add(f"DEMO-{i + 1:02d}", {f: float(row[f]) for f in FEATURES})
+ 
+    journey = [  # same student after support: access fixed, attendance and marks rise
+        (60, dict(attendance_pct=62, avg_score=40, assignment_completion=45,
+                  study_hours_week=4, has_internet=0, has_device=1)),
+        (30, dict(attendance_pct=70, avg_score=48, assignment_completion=58,
+                  study_hours_week=6, has_internet=1, has_device=1)),
+        (0, dict(attendance_pct=82, avg_score=60, assignment_completion=72,
+                 study_hours_week=8, has_internet=1, has_device=1)),
+    ]
+    for days_ago, s in journey:
+        add("DEMO-IMPROVING", s, days_ago)
+ 
